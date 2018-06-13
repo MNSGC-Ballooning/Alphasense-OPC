@@ -1,3 +1,5 @@
+
+
 /*
 Joseph Habeck, May 2018
 
@@ -28,37 +30,66 @@ The circuit includes:
 
 #include <SPI.h>
 #include <SD.h>
+#include <SoftwareSerial.h>
 
 // Used for Dallas temp sensor:
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #define ONE_WIRE_BUS 3
-#define TWO_WIRE_BUS 4
+#define TWO_WIRE_BUS 30
 #define THREE_WIRE_BUS 5
+#define FOUR_WIRE_BUS 7
+#define chipSelect 4 
+#define dataLED 27
+#define fixLED 28
+#define ledSD 29
+#define qSwitchOPC 2
+#define qSwitchBatt 6
+#define opcSwitch 9
 
 OneWire oneWireOne(ONE_WIRE_BUS);
 OneWire oneWireTwo(TWO_WIRE_BUS);
 OneWire oneWireThree(THREE_WIRE_BUS);
+OneWire oneWireFour(FOUR_WIRE_BUS);
 
 DallasTemperature sensors1(&oneWireOne);        // Temp sensor for OPC
 DallasTemperature sensors2(&oneWireTwo);        // Temp sensor for Battery
 DallasTemperature sensors3(&oneWireThree);      // Temp sensor for Atmosphere
-//
-int x = 1;
+DallasTemperature sensors4(&oneWireFour);      // Temp sensor for ambient box temperature
+
+/////Sensor Suite////////
+#include <TinyGPS++.h>
+#include <SparkFun_ADXL345.h>
+
+TinyGPSPlus GPS;
+int GPSstartTime;
+boolean newDay = false;
+boolean firstFix = false;
+int days = 0;
+boolean newData = false;
+int checkTime;
+String sensorSuite = "";
+
+ADXL345 adxl = ADXL345();
+int x,y,z;
 
 // Set pins
-int tPin1 = 3;                    // set digital pin 3 (digital temp sensor) OPC
-int tPin2 = 4;                    // set digital pin 4 (digital temp sensor) BATT
-int tPin3 = 5;                    // set digital pin 5 (digital temp sensor) Atmos.
-int qSwitchOPC = 2;               // set digital pin 2 (OPC heater relay 1)
-int qSwitchBatt = 6;              // set digital pin 6 (Battery relay 2)
-int opcSwitch = 9;                // set digiral pin 9 (OPC relay)
+//int tPin1 = 3;                    // set digital pin 3 (digital temp sensor) OPC
+//int tPin2 = 4;                    // set digital pin 4 (digital temp sensor) BATT
+//int tPin3 = 5;                    // set digital pin 5 (digital temp sensor) Atmos.
+//int tpin4 = 7;
+//int qSwitchOPC = 2;               // set digital pin 2 (OPC heater relay 1)
+//int qSwitchBatt = 6;              // set digital pin 6 (Battery relay 2)
+//int opcSwitch = 9;                // set digiral pin 9 (OPC relay)
     
 // Define variables
 float t1;                         // OPC temp (digital) 
 float t2;                         // Battery temp (digital)
 float t3;                         // outside temp (digital)
-float samp_freq=1400;             // sampling frequency (ms)
+float t4;
+float samp_freq=5000;             // sampling frequency (ms)
+long lastTime = 0;
+
 float t_low = 283;                // critical low temp (heater turns ON if t1,t2 < t_low)
 float t_high = 289;               // critical high temp (heater turns OFF if t1,t2 > t_high)
 int hold1;                        // used for OPC heater switch
@@ -68,10 +99,45 @@ int hold2;                        // used for Battery heater switch
 String data;                      // used for data logging
 String heaterStatusOPC;           // used for data logging; will be "OPC ON" or "OPC OFF" 
 String heaterStatusBatt;          // used for data logging; will be "Batt ON" or "Batt OFF"
-String filename = "tempLog.csv";  // file name that data wil be written to
-const int CS = 8;                 // CS pin on SD card
-File tempLog;                     // file that data is written to 
-unsigned long FT;                 // flight-time
+String filename = "";  // file name that data wil be written to
+boolean flightLogOpen = false;
+boolean OPC = false;
+
+unsigned long FT = 0;
+File fLog;
+String testName = "";
+boolean testFileOpen = false;
+String test = "";
+
+//////////////////LED Stuff////////
+class action {
+  protected:
+    unsigned long Time;
+    String nam;
+  public:
+    String getName();
+};
+class Blink: public action {
+  protected:
+    int ondelay;
+    int offdelay;
+    int ontimes;
+  public:
+    friend void blinkMode();
+    void BLINK();
+    Blink();
+    Blink(int on, int off, int times, String NAM, unsigned long tim);
+    int getOnTimes();
+};
+Blink recoveryBlink = Blink(200, 2000, -1, "recoveryBlink", 0);
+Blink countdownBlink = Blink(200, 850, -1, "countdownBlink", 0);
+Blink* currentBlink = &countdownBlink;
+
+boolean LEDon = false;
+#define FixDelay 1000
+#define noFixDelay 15000
+boolean recovery = false;
+
 
 // Setup
 void setup() {
@@ -81,14 +147,33 @@ void setup() {
   sensors1.begin();               
   sensors2.begin();
   sensors3.begin();
+  sensors4.begin();
+
+  // Initialize GPS Serial
+  Serial1.begin(4800);
+
+  // Initialize Accelerometer
+  adxl.powerOn();
+  adxl.setRangeSetting(16);
+  adxl.setSpiBit(0);
   
   // Initalize digital pins:
-  pinMode(tPin1, INPUT);  // OPC
+  /*pinMode(tPin1, INPUT);  // OPC
   pinMode(tPin2, INPUT);  // Battery
   pinMode(tPin3, INPUT);  // Outside world
+  pinMode(tpin4, INPUT);  // Inside box
+  */
   pinMode(qSwitchOPC, OUTPUT);
   pinMode(qSwitchBatt, OUTPUT);
   pinMode(opcSwitch, OUTPUT);
+  pinMode(chipSelect, OUTPUT);
+  pinMode(dataLED, OUTPUT);
+  pinMode(fixLED, OUTPUT);
+  pinMode(ledSD, OUTPUT);
+  //pinMode(53, OUTPUT);
+  //digitalWrite(53, HIGH);
+  
+  //pinMode(53, OUTPUT);
   
   // Open serial port(s):
   while (!Serial){
@@ -98,38 +183,56 @@ void setup() {
   Serial.print("Initializing SD card...");
 
   // Check if card is present/initalized: 
-  if (!SD.begin(CS)){
-  Serial.println("card initialization FAILED - something is wrong..."); // card not present or initialization failed
-  while (1); // dont do anything more
+  if (!SD.begin(chipSelect)){
+    Serial.println("card initialization FAILED - something is wrong..."); // card not present or initialization failed
+    while (1){
+    }    // dont do anything more
   }
   
   Serial.println("card initialization PASSED... bon voyage!"); // initialization successful
-
-  // Initialize file:
-  tempLog = SD.open(filename, FILE_WRITE); // open file
-  
-  if (tempLog) {
+  for (int i = 0; i < 100; i++) {
+    if (!SD.exists("flight" + String(i / 10) + String(i % 10) + ".csv")) {
+      filename = "flight" + String(i / 10) + String(i % 10) + ".csv";
+      fLog = SD.open(filename, FILE_WRITE); // open file
+      //Serial.println(filename);
+      flightLogOpen = true;
+      digitalWrite(ledSD, HIGH);
+      break;
+    }
+  }
+  if (flightLogOpen) {
     Serial.println( filename + " opened...");
-    tempLog.println("Temperature 1 (OPC) (K), Temperature 2 (Battery) (K), Temperature 3 (atmos.) (K), OPC Heater Status, Batt. Heater Status, Flight Time (hour:min:sec)"); // file heading
-    tempLog.close();
+    fLog.println("Flight Time, Lat, Long, Altitude (ft), Date, Hour:Min:Sec, Fix, Accel x, Accel y, Accel z, Temperature (Box), Temperature 1 (OPC) (K), Temperature 2 (Battery) (K), Temperature 3 (atmos.) (K), OPC Heater Status, Batt. Heater Status, Flight Time (hour:min:sec)"); // file heading
+    fLog.close();
+    flightLogOpen = false;
+    digitalWrite(ledSD, LOW);
     Serial.println("File initialized... begin data logging!");
   }
   else {
     Serial.println("error opening file");
     return;
   }
+  
+  // Initialize file:
+  
+  
+  
+ 
   digitalWrite(opcSwitch, HIGH);  // power on OPC
   Serial.println("OPC qued... please wait ~60 seconds"); // (OPC takes approx. 60 sec to turn on in Standalone mode)
 }
 
 
 void loop() {
-  FT = millis() / 1000; // set flight-time variable to Arduino internal clock
-
+  //FT = millis() / 1000; // set flight-time variable to Arduino internal clock
+  blinkMode();
+  Fixblink();
+  
   // Request temperatures for all sensors
   sensors1.requestTemperatures();
   sensors2.requestTemperatures();
   sensors3.requestTemperatures();
+  sensors4.requestTemperatures();
   
   ////////// Temperature monitoring ////////// 
   
@@ -139,18 +242,20 @@ void loop() {
   t2 = t2 + 273.15;                       
   t3 = sensors3.getTempCByIndex(0);        // Outside world digital temp in celcius
   t3 = t3 + 273.15;
+  t4 = sensors4.getTempCByIndex(0);
+  t4 = t3 + 273.15;
 
   ////////// Heater operation //////////
 
 // "test-fire" heater after Arduino clock has started; NOTE heater does not depend on temperature values during this time!
-  if (FT<(60)){
+  if ((millis()/1000)<(60)){
    digitalWrite(qSwitchOPC, HIGH); 
    heaterStatusOPC = "OPC ON";
-   Serial.println("testing OPC heater");
+   //Serial.println("testing OPC heater");
    
    digitalWrite(qSwitchBatt, HIGH);
    heaterStatusBatt = "Batt ON";
-   Serial.println("testing BATT heater");
+   //Serial.println("testing BATT heater");
   }
   
 // compare digital temp. to critical temp.:  
@@ -192,8 +297,10 @@ void loop() {
   }
 
 ////////// Datalogging //////////
-
+updateGPS();
 data = "";
+data = sensorSuite;
+data += ",";
 data += t1;               
 data += ",";               
 data += t2;
@@ -204,26 +311,35 @@ data += heaterStatusOPC;     // log OPC heater status (either "OPC ON" or "OPC O
 data += ",";
 data += heaterStatusBatt;    // log battery heater status (either "Batt ON" or "Batt OFF")
 data += ",";
-data += flightTime(FT);      // log flight time; flightTime is a user-defined function
+data += flightTimeStr();      // log flight time; flightTime is a user-defined function
+test="1,2,3,4";
 
 ////////// Data Writing //////////
-
- tempLog = SD.open("tempLog.csv", FILE_WRITE); // open file
-
- if (tempLog) {
-    //Serial.println("tempLog.csv opened..."); // file open successfully 
-    tempLog.println(data);
-    tempLog.close();
+if(millis()-lastTime>=samp_freq){
+ fLog = SD.open(filename, FILE_WRITE); // open file
+ flightLogOpen = true;
+ digitalWrite(ledSD, HIGH);
+ if (flightLogOpen) {
+    //Serial.println("flightLog.csv opened..."); // file open successfully 
+    fLog.println(data);
     Serial.println(data);
+    fLog.close();
+    flightLogOpen = false;
+    digitalWrite(ledSD, LOW);
+    
   }
   else {
     Serial.println("error opening file"); // file open failed
     return;
   }
+  
+  lastTime=millis();
+}
 
-  delay(samp_freq); // delay 1 second i.e. do all that every 1 second 
-  x=x+1;
+  //delay(samp_freq); // delay 1 second i.e. do all that every 1 second 
+
 } // End main loop
+
 
 ///////// User-defined functions //////////
 
@@ -236,7 +352,7 @@ float getAnalogTemp(int pin) {
 }
 
 // Reads in time from Arduino clock (seconds) and converts it to hr:min:sec; written by: Simon Peterson 
-String flightTime(unsigned long t) {
+/*String flightTime(unsigned long t) {
   String fTime = "";
   fTime += (String(t / 3600) + ":");
   t %= 3600;
@@ -246,4 +362,4 @@ String flightTime(unsigned long t) {
   t %= 60;
   fTime += (String(t / 10) + String(t % 10));
   return fTime;
-}
+}*/
